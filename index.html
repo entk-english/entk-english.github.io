@@ -281,6 +281,25 @@
   .catbtn:hover{transform:translate(-1px,-1px);}
   .catbtn.on{background:var(--cyan); color:var(--edge); box-shadow:4px 4px 0 var(--edge);}
 
+  /* voting */
+  .votebtn{
+    font-family:'Outfit',sans-serif; font-weight:800; font-size:15px; cursor:pointer;
+    padding:13px 18px; border-radius:100px; border:3px solid var(--edge);
+    background:var(--cream); color:var(--edge); box-shadow:4px 4px 0 var(--edge);
+    transition:transform .1s ease;
+  }
+  .votebtn:hover{transform:translate(-2px,-2px);}
+  .votebtn.on{background:var(--pink); color:var(--cream); box-shadow:5px 5px 0 var(--edge);}
+
+  /* written story */
+  .story{display:flex; flex-direction:column; gap:9px; margin-top:12px; text-align:left;}
+  .sline{
+    background:var(--surface2); border:2.5px solid var(--edge); border-radius:13px;
+    padding:11px 14px; font-weight:600; font-size:14.5px; line-height:1.45; color:var(--cream);
+  }
+  .sline b{display:block; font-size:11.5px; text-transform:uppercase; letter-spacing:.08em;
+    color:var(--lime); margin-bottom:4px;}
+
   /* timer */
   .clock{
     font-family:'Space Mono',monospace; font-weight:700;
@@ -480,18 +499,37 @@ function settleMe(){
 }
 
 /* ---- presence: mark offline the moment the connection drops ---- */
+function detachPresence(){
+  if(S.presCb){ S.db.ref(".info/connected").off("value", S.presCb); S.presCb=null; }
+  S.presenceOn = false;
+}
 function attachPresence(){
-  if(S.presenceOn || !S.me) return;
+  detachPresence();
+  if(!S.me) return;
+  const key = S.me, ref = roomRef().child("players/" + key);
   S.presenceOn = true;
-  const ref = roomRef().child("players/" + S.me);
-  S.db.ref(".info/connected").on("value", s=>{
-    if(s.val() !== true || !S.me) return;
+  S.presCb = S.db.ref(".info/connected").on("value", s=>{
+    if(s.val() !== true || S.me !== key) return;   /* stale identity — ignore */
     ref.once("value").then(snap=>{
-      if(!snap.exists()) return;   /* already removed — never recreate a ghost */
+      if(!snap.exists() || S.me !== key) return;   /* removed — never recreate a ghost */
       ref.onDisconnect().update({online:false, off:firebase.database.ServerValue.TIMESTAMP});
       ref.update({online:true});
     });
   });
+}
+
+/* ---- note 1: leave this identity behind and join fresh under a new name ---- */
+function joinAsSomeoneElse(){
+  if(!confirm("Leave the game and join again with a different name?\n\nYour current name will show as offline so the host can remove it."))return;
+  const old = S.me ? roomRef().child("players/" + S.me) : null;
+  detachPresence();
+  if(old){
+    old.onDisconnect().cancel();
+    old.update({online:false, off:firebase.database.ServerValue.TIMESTAMP});
+  }
+  const fresh = "d" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  try{ localStorage.setItem(DEV_KEY, fresh); }catch(e){ S._dev = fresh; }
+  S.me = null; S.view = "joinName"; draw();
 }
 
 /* ---- host: archive then remove anyone offline too long ---- */
@@ -516,7 +554,7 @@ function newRoomCode(){
   return s;
 }
 function freshGame(){
-  return { activity:"lobby", players:{}, wheel:null, secret:null, chain:null, pairs:null,
+  return { activity:"lobby", label:"", players:{}, wheel:null, secret:null, chain:null, pairs:null,
            imp:null, scenarios:DEFAULT_SCENARIOS.slice(), created:Date.now() };
 }
 
@@ -651,7 +689,7 @@ function vAuth(){
 function vJoinName(){
   app.innerHTML=`
   <div class="stage">
-    <span class="tag">Room ${esc(S.room)}</span>
+    <span class="tag">${(S.G&&S.G.label)?esc(S.G.label):"Room "+esc(S.room)}</span>
     <h1 class="hero-title" style="margin-top:16px;font-size:clamp(34px,10vw,56px);">What's<em>your name?</em></h1>
     <p class="lede">That's all — no sign-up, no password.</p>
     <div class="col">
@@ -693,33 +731,48 @@ function vPlay(){
   let body="";
 
   if(A==="secret" && S.G.secret){
-    const sec=S.G.secret, o=SECRETS[sec.idx]||SECRETS[0];
+    const sec=S.G.secret, o=SECRETS[sec.idx]||SECRETS[0], ask=askerOf(sec,list);
+    let card;
     if(sec.keeperId===me){
-      body=`<div class="box amber revealcard" style="max-width:370px;width:100%;">
+      card=`<div class="box amber revealcard" style="max-width:370px;width:100%;">
         <span class="catbadge">${catEmo(o[2])} ${esc(o[2])}</span>
         <div class="emo">${o[0]}</div><div class="nm">${esc(o[1])}</div>
         <div class="hushbar">🤫 Only you can see this. Answer YES or NO only.</div></div>`;
     } else {
-      body=`<div class="box cyan" style="max-width:370px;width:100%;text-align:center;">
+      card=`<div class="box cyan" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:46px;">🕵️</div>
         <div class="disp" style="font-size:24px;text-transform:uppercase;margin-top:8px;">${esc(sec.keeperName)} has a secret</div>
-        <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's a ${esc(o[2])}</span></div>
-        <p style="font-weight:600;margin-top:12px;">Ask yes/no questions in Discord and guess it!</p></div>`;
+        <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's ${artic(o[2])} ${esc(o[2])}</span></div>
+        <p style="font-weight:600;margin-top:12px;">Ask yes/no questions and guess it!</p></div>`;
     }
+    let turnline="";
+    if(ask){
+      const iAsk=ask.id===me, iKeep=sec.keeperId===me;
+      turnline=`<div class="box ${iAsk?"lime yourturn":(iKeep?"cyan":"")}" style="max-width:370px;width:100%;text-align:center;">
+        <div class="disp" style="font-size:${iAsk||iKeep?"23px":"19px"};text-transform:uppercase;">
+          ${iAsk?"🎤 Your turn — ask a yes/no question"
+                :(iKeep?("👂 "+esc(ask.name)+" is asking you")
+                      :(esc(ask.name)+" ➜ "+esc(sec.keeperName)))}</div></div>`;
+    }
+    body=`<div style="display:flex;flex-direction:column;gap:14px;align-items:center;width:100%;">${card}${turnline}</div>`;
   } else if(A==="imposter" && S.G.imp){
     const im=S.G.imp, o=SECRETS[im.idx]||SECRETS[0], amImp=im.impId===me, t=impTimer();
 
     let card;
     if(im.revealed){
+      const myVote=((im.vote||{}).tally||{})[me];
       card=`<div class="box lime" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:56px;">🎭</div>
         <div class="disp" style="font-size:26px;text-transform:uppercase;margin-top:6px;">The imposter was ${esc(im.impName)}</div>
-        <p style="font-weight:700;margin-top:8px;">The word was ${o[0]} ${esc(o[1])}</p></div>`;
+        <p style="font-weight:700;margin-top:8px;">The word was ${o[0]} ${esc(o[1])}</p>
+        ${im.result?`<p style="font-weight:800;margin-top:10px;">${esc(im.result)}</p>`:""}
+        ${myVote?`<div style="margin-top:12px;"><span class="catbadge big">${
+          myVote===im.impId?"✅ You guessed right":"❌ You guessed wrong"}</span></div>`:""}</div>`;
     } else if(amImp){
       card=`<div class="box pink yourturn" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:64px;">🕵️</div>
         <div class="disp" style="font-size:30px;text-transform:uppercase;margin-top:6px;">You're the imposter</div>
-        <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's a ${esc(o[2])}</span></div>
+        <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's ${artic(o[2])} ${esc(o[2])}</span></div>
         <p style="font-weight:700;margin-top:12px;">You don't know the word. Listen carefully and bluff — don't get caught!</p></div>`;
     } else {
       card=`<div class="box amber revealcard" style="max-width:370px;width:100%;">
@@ -742,8 +795,21 @@ function vPlay(){
     const clock=(!im.revealed && !t.none)?`<div class="box" style="max-width:370px;width:100%;text-align:center;padding:14px;">
       <div class="clock small" data-timer>${fmtTime(t.left)}</div></div>`:"";
 
+    let vote="";
+    if(im.vote && im.vote.open && !im.revealed){
+      const mine=(im.vote.tally||{})[me];
+      vote=`<div class="box" style="max-width:370px;width:100%;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">🗳️ Who is the imposter?</div>
+        <div class="names" style="margin-top:12px;justify-content:center;">
+          ${list.filter(p=>p.id!==me).map(p=>
+            `<button class="votebtn ${mine===p.id?"on":""}" data-v="${p.id}">${esc(p.name)}</button>`).join("")}
+        </div>
+        <p style="font-weight:700;margin-top:12px;font-size:13.5px;color:var(--dim);">${
+          mine?"Voted — tap another name to change your mind.":"Tap a name to vote."}</p></div>`;
+    }
+
     body=`<div style="display:flex;flex-direction:column;gap:14px;align-items:center;width:100%;">
-      ${card}${qline}${clock}</div>`;
+      ${card}${qline}${clock}${vote}</div>`;
   } else if(A==="wheel"){
     const w=S.G.wheel;
     body=`<div class="box" style="max-width:370px;width:100%;text-align:center;">
@@ -780,7 +846,10 @@ function vPlay(){
       turncard=`<div class="box lime yourturn" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:64px;">🎤</div>
         <div class="disp" style="font-size:30px;text-transform:uppercase;margin-top:6px;">Your turn!</div>
-        <p style="font-weight:700;margin-top:8px;">Add your sentence to the story — speak now.</p></div>`;
+        <p style="font-weight:700;margin-top:8px;">Say your sentence out loud, then type it so the next person can read it.</p>
+        <textarea class="input" id="lineinput" maxlength="220" placeholder="Type the sentence you just said…"
+          style="min-height:76px;margin-top:12px;font-family:'Outfit',sans-serif;font-size:15px;"></textarea>
+        <button class="btn btn-block" id="sendline" style="margin-top:10px;">Send &amp; pass on ▶</button></div>`;
     } else if(pos===turn+1){
       turncard=`<div class="box amber" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:48px;">⏳</div>
@@ -802,7 +871,7 @@ function vPlay(){
       `<div class="tdot ${i<turn?"past":""} ${i===turn?"now":""} ${id===me?"mine":""}">${i+1}</div>`).join("")}</div>`:"";
 
     body=`<div style="display:flex;flex-direction:column;gap:14px;align-items:center;width:100%;">
-      ${turncard}${theme}${track}</div>`;
+      ${turncard}${storyBlock(c)}${theme}${track}</div>`;
   } else {
     body=`<div class="box" style="max-width:370px;width:100%;text-align:center;">
       <div style="font-size:44px;">🎉</div>
@@ -811,14 +880,37 @@ function vPlay(){
 
   app.innerHTML=`
   <div class="stage">
-    <span class="tag live"><b></b> ${esc(myName())} · ${list.length} playing</span>
+    <span class="tag live"><b></b> ${esc(myName())} · ${list.length} playing${S.G.label?" · "+esc(S.G.label):""}</span>
     <div style="margin-top:20px;width:100%;display:flex;justify-content:center;">${body}</div>
-    <button class="btn btn-sm btn-dark" id="ren" style="margin-top:22px;">Change my name</button>
+    <button class="btn btn-sm btn-dark" id="ren" style="margin-top:22px;">Not you? Join as someone else</button>
   </div>`;
-  document.getElementById("ren").onclick=()=>{
-    const v=(prompt("Change your name to:", myName())||"").trim();
-    if(v) roomRef().child("players/"+S.me+"/name").set(v.slice(0,22));
-  };
+  document.getElementById("ren").onclick=joinAsSomeoneElse;
+  app.querySelectorAll("[data-v]").forEach(x=>x.onclick=()=>
+    roomRef().child("imp/vote/tally/"+S.me).set(x.dataset.v));
+  const sb=document.getElementById("sendline");
+  if(sb) sb.onclick=sendChainLine;
+  const li=document.getElementById("lineinput");
+  if(li) li.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendChainLine(); } });
+}
+
+/* ---- note 4: the speaker types their sentence; everyone reads the story ---- */
+function sendChainLine(){
+  const el=document.getElementById("lineinput");
+  if(!el) return;
+  const v=el.value.trim();
+  if(!v) return;
+  const c=S.G.chain||{}, lines=(c.lines||[]).slice();
+  lines.push({id:S.me, name:myName(), text:v.slice(0,220)});
+  el.value="";
+  up({"chain/lines":lines, "chain/turn":(typeof c.turn==="number"?c.turn:0)+1});
+}
+function storyBlock(c){
+  const lines=(c&&c.lines)||[];
+  if(!lines.length) return "";
+  return `<div class="box" style="max-width:370px;width:100%;">
+    <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">The story so far</div>
+    <div class="story">${lines.map((l,i)=>
+      `<div class="sline"><b>${i+1}. ${esc(l.name)}</b>${esc(l.text)}</div>`).join("")}</div></div>`;
 }
 
 /* ================= host ================= */
@@ -842,6 +934,11 @@ function vHost(){
     <div class="box cyan" style="margin-bottom:18px;">
       <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">Send this link to your group</div>
       <div class="codebig">${esc(S.room)}</div>
+      <div class="addrow" style="margin-bottom:12px;">
+        <input class="input" id="rlbl" maxlength="34" value="${esc(S.labelDraft!=null?S.labelDraft:(S.G.label||""))}"
+          placeholder="Name this room — e.g. VC 1 · Beginners">
+        <button class="btn btn-sm btn-cyan" id="rlblsave">Save</button>
+      </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <button class="btn btn-sm" id="cpL">Copy join link</button>
         <button class="btn btn-sm btn-pink" id="cpM">Copy Discord message</button>
@@ -861,10 +958,16 @@ function vHost(){
   </div>`;
 
   const link = location.origin + location.pathname + "?room=" + S.room;
+  const lbl = S.G.label ? " (" + S.G.label + ")" : "";
   document.getElementById("cpL").onclick=e=>cp(link,e.target,"Copy join link");
   document.getElementById("cpM").onclick=e=>cp(
-    `🎮 English Hub Game Night is starting!\nTap the link and type your name — that's it, no sign-up:\n${link}`,
+    `🎮 English Hub Game Night is starting${lbl}!\nTap the link and type your name — that's it, no sign-up:\n${link}`,
     e.target,"Copy Discord message");
+  const lblEl=document.getElementById("rlbl");
+  const saveLbl=()=>{ S.labelDraft=null; up({label:lblEl.value.trim().slice(0,34)}); };
+  document.getElementById("rlblsave").onclick=saveLbl;
+  lblEl.addEventListener("input",()=>{ S.labelDraft=lblEl.value; });
+  lblEl.addEventListener("keydown",e=>{if(e.key==="Enter")saveLbl();});
 
   document.querySelectorAll(".navtab").forEach(b=>b.onclick=()=>{
     S.tab=b.dataset.t; S.wheelSig="";
@@ -961,6 +1064,7 @@ function doSpin(){
 }
 
 function catEmo(c){ const f=CATS.find(x=>x[0]===c); return f?f[2]:"🎲"; }
+function artic(w){ return /^[aeiou]/i.test(String(w||"")) ? "an" : "a"; }
 
 /* ================= shared timer ================= */
 function impTimer(){
@@ -1011,7 +1115,21 @@ function hSecret(b){
         <div style="font-size:56px;margin-top:8px;">${o[0]}</div>
         <div class="disp" style="font-size:26px;text-transform:uppercase;">${esc(o[1])}</div>
         <div style="margin-top:10px;"><span class="catbadge">${catEmo(o[2])} ${esc(o[2])}</span></div>
-      </div>`:""}
+      </div>
+      ${(sec.order&&sec.order.length)?`
+      <div class="box cyan" style="margin-top:14px;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">Asking now</div>
+        <div class="disp" style="font-size:clamp(22px,6vw,34px);text-transform:uppercase;margin-top:6px;">
+          🎤 ${esc((askerOf(sec,list)||{}).name)} <span style="opacity:.55;">➜</span> ${esc(sec.keeperName)}</div>
+        <div class="track" style="margin:14px auto 0;">${(sec.order||[]).map((id,i)=>{
+          const p=list.find(x=>x.id===id);
+          return `<div class="tdot ${i===((sec.turn||0)%sec.order.length)?"now":""}" title="${esc(p?p.name:"left")}">${i+1}</div>`;
+        }).join("")}</div>
+        <div class="ctlrow" style="margin-top:14px;">
+          <button class="btn btn-sm btn-dark" id="sprev">◀ Back</button>
+          <button class="btn btn-pink" id="snext">🎲 Next asker ▶</button>
+        </div>
+      </div>`:""}`:""}
     <div class="box" style="margin-top:14px;">
       ${list.length?`<button class="btn btn-lime btn-block" id="go">${sec?"New round":"Start a round"}</button>`
         :`<div class="none">Waiting for players to join.</div>`}
@@ -1022,9 +1140,33 @@ function hSecret(b){
     const pool=SECRETS.map((s,i)=>i).filter(i=>S.secretCat==="Any"||SECRETS[i][2]===S.secretCat);
     const k=list[Math.floor(Math.random()*list.length)];
     up({secret:{keeperId:k.id, keeperName:k.name,
-      idx:pool[Math.floor(Math.random()*pool.length)], ts:Date.now()}, activity:"secret"});
+      idx:pool[Math.floor(Math.random()*pool.length)],
+      order:list.filter(p=>p.id!==k.id).map(p=>p.id).sort(()=>Math.random()-0.5),
+      turn:0, ts:Date.now()}, activity:"secret"});
     burst();
   };
+  const nx=document.getElementById("snext");
+  if(nx)nx.onclick=()=>up({"secret/turn":nextLiveTurn(sec.order||[], (sec.turn||0)+1, list)});
+  const pv=document.getElementById("sprev");
+  if(pv)pv.onclick=()=>up({"secret/turn":Math.max(0,(sec.turn||0)-1)});
+}
+
+/* walk forward past anyone who has left the room; wraps so questioning never ends */
+function nextLiveTurn(order, from, list){
+  if(!order.length) return 0;
+  for(let i=0;i<order.length;i++){
+    const at=(from+i)%order.length;
+    if(list.some(p=>p.id===order[at])) return at;
+  }
+  return from%order.length;
+}
+/* who is asking right now, and who is answering */
+function askerOf(sec, list){
+  const order=sec.order||[];
+  if(!order.length) return null;
+  const id=order[(sec.turn||0)%order.length];
+  const p=list.find(x=>x.id===id);
+  return {id, name:p?p.name:"(left)"};
 }
 
 function newAsk(list, prev){
@@ -1037,6 +1179,16 @@ function newAsk(list, prev){
   }while((a.id===z.id || (prev && prev.from===a.id && prev.to===z.id)) && tries<40);
   if(a.id===z.id) return null;
   return {from:a.id, fromName:a.name, to:z.id, toName:z.name, n:(prev?(prev.n||0):0)+1};
+}
+
+/* votes per accused player, highest first */
+function voteCounts(im, list){
+  const tally=(im&&im.vote&&im.vote.tally)||{}, n={};
+  Object.keys(tally).forEach(v=>{ n[tally[v]]=(n[tally[v]]||0)+1; });
+  return Object.keys(n).map(id=>{
+    const p=list.find(x=>x.id===id);
+    return {id, name:p?p.name:"(left)", n:n[id]};
+  }).sort((a,z)=>z.n-a.n);
 }
 
 function hImposter(b){
@@ -1088,12 +1240,28 @@ function hImposter(b){
         <div class="ctlrow" style="margin-top:14px;"><button class="btn btn-amber" id="iask">🎲 ${im.ask?"Next question":"First question"}</button></div>
       </div>
 
+      ${(()=>{ const v=im.vote||{}, tally=v.tally||{}, voted=Object.keys(tally).length;
+        const counts=voteCounts(im,list);
+        return `<div class="box ${v.open?"amber":""}" style="margin-top:14px;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;text-align:center;">Voting</div>
+        ${v.open||voted?`
+          <div style="text-align:center;font-weight:800;margin-top:8px;">${voted} of ${list.length} voted</div>
+          <div class="names" style="margin-top:12px;justify-content:center;">
+            ${counts.map(c=>`<div class="name-chip">${esc(c.name)} · ${c.n}</div>`).join("")||`<div class="none">No votes yet.</div>`}
+          </div>`:""}
+        <div class="ctlrow" style="margin-top:14px;">
+          ${im.revealed?"":(v.open
+            ? `<button class="btn btn-sm btn-dark" id="vstop">⏸ Pause voting</button>`
+            : `<button class="btn btn-cyan" id="vgo">🗳️ ${voted?"Reopen voting":"Start voting"}</button>`)}
+        </div></div>`; })()}
+
       <div class="box ${im.revealed?"lime":""}" style="margin-top:14px;text-align:center;">
         ${im.revealed
           ? `<div style="font-size:46px;">🎭</div>
              <div class="disp" style="font-size:26px;text-transform:uppercase;margin-top:6px;">It was ${esc(im.impName)}</div>
-             <p style="font-weight:700;margin-top:6px;">The word was ${o[0]} ${esc(o[1])}</p>`
-          : `<button class="btn btn-block" id="irev">🎭 Reveal the imposter</button>`}
+             <p style="font-weight:700;margin-top:6px;">The word was ${o[0]} ${esc(o[1])}</p>
+             <p style="font-weight:800;margin-top:10px;">${esc(im.result||"")}</p>`
+          : `<button class="btn btn-block" id="irev">🎭 Reveal &amp; score</button>`}
       </div>`:""}`;
 
   b.querySelectorAll("[data-ic]").forEach(x=>x.onclick=()=>{ S.impCat=x.dataset.ic; draw(); });
@@ -1114,8 +1282,34 @@ function hImposter(b){
   const ask=document.getElementById("iask");
   if(ask)ask.onclick=()=>{ const a=newAsk(list, im.ask); if(a) up({"imp/ask":a}); };
 
+  const vg=document.getElementById("vgo");
+  if(vg)vg.onclick=()=>up({"imp/vote/open":true});
+  const vs=document.getElementById("vstop");
+  if(vs)vs.onclick=()=>up({"imp/vote/open":false});
+
   const rev=document.getElementById("irev");
-  if(rev)rev.onclick=()=>{ if(confirm("Show everyone who the imposter was?")) up({"imp/revealed":true}); };
+  if(rev)rev.onclick=()=>{
+    if(!confirm("Reveal the imposter and award the points?"))return;
+    const tally=(im.vote&&im.vote.tally)||{}, counts=voteCounts(im,list);
+    const top=counts.length?counts[0].n:0;
+    const caught=counts.some(c=>c.id===im.impId && c.n===top && top>0);
+    const patch={"imp/revealed":true,"imp/vote/open":false};
+    let right=0;
+    Object.keys(tally).forEach(voter=>{
+      if(tally[voter]===im.impId){
+        const p=list.find(x=>x.id===voter);
+        if(p){ patch["players/"+voter+"/pts"]=(p.pts||0)+1; right++; }
+      }
+    });
+    if(!caught){
+      const p=list.find(x=>x.id===im.impId);
+      if(p) patch["players/"+im.impId+"/pts"]=(p.pts||0)+2;
+    }
+    patch["imp/result"] = caught
+      ? "Caught! "+right+" voted correctly (+1 each)."
+      : "The imposter escaped! "+esc(im.impName)+" gets +2"+(right?" · "+right+" still voted correctly (+1 each)":"")+".";
+    up(patch); burst();
+  };
 
   const setD=()=>{
     const d=parseTime(document.getElementById("tdur").value);
@@ -1171,7 +1365,14 @@ function hChain(b){
           <button class="btn btn-pink" id="next" ${done?"disabled":""}>Next speaker ▶</button>
           <button class="btn btn-sm btn-dark" id="restart">↻ Restart order</button>
         </div>
-      </div>`:``}`;
+      </div>
+      ${(c.lines&&c.lines.length)?`
+      <div class="box" style="margin-top:14px;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">The story so far</div>
+        <div class="story">${c.lines.map((l,i)=>
+          `<div class="sline"><b>${i+1}. ${esc(l.name)}</b>${esc(l.text)}</div>`).join("")}</div>
+        <button class="btn btn-sm btn-dark" id="clrstory" style="margin-top:14px;">Clear the story</button>
+      </div>`:""}`:``}`;
   const g=document.getElementById("go");
   if(g)g.onclick=()=>up({chain:{theme:THEMES[Math.floor(Math.random()*THEMES.length)],
     order:list.map(p=>p.id).sort(()=>Math.random()-0.5), turn:0, ts:Date.now()}, activity:"chain"});
@@ -1181,6 +1382,8 @@ function hChain(b){
   if(pv)pv.onclick=()=>up({"chain/turn":Math.max(0,turn-1)});
   const rs=document.getElementById("restart");
   if(rs)rs.onclick=()=>up({"chain/turn":0});
+  const cs=document.getElementById("clrstory");
+  if(cs)cs.onclick=()=>{ if(confirm("Delete the written story? The speaking order stays."))up({"chain/lines":null}); };
 }
 
 function hPairs(b){
