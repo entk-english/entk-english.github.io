@@ -299,6 +299,18 @@
   }
   .sline b{display:block; font-size:11.5px; text-transform:uppercase; letter-spacing:.08em;
     color:var(--lime); margin-bottom:4px;}
+  .playbtn{
+    display:inline-block; margin-top:8px; cursor:pointer;
+    font-family:'Outfit',sans-serif; font-weight:800; font-size:12.5px;
+    padding:7px 13px; border-radius:100px; border:2.5px solid var(--edge);
+    background:var(--cyan); color:var(--edge); box-shadow:2px 2px 0 var(--edge);
+  }
+  .playbtn:active{transform:translate(2px,2px); box-shadow:0 0 0 var(--edge);}
+  .recok{
+    font-family:'Space Mono',monospace; font-size:12px; font-weight:700; letter-spacing:.08em;
+    text-transform:uppercase; background:var(--edge); color:var(--lime);
+    border-radius:100px; padding:9px 14px; display:inline-block;
+  }
 
   /* timer */
   .clock{
@@ -427,8 +439,94 @@ const S = {
   G:null,                       // live game snapshot from firebase
   spinning:false, rot:0, wheelSig:"", localWinner:null,
   seenSpin:null, scenarioDraft:"", secretCat:"Any", impCat:"Any",
-  tOff:0, busy:false, presenceOn:false
+  tOff:0, busy:false, presenceOn:false,
+  mr:null, recording:false, recData:null, recTimer:null, recStart:0,
+  recErr:"", clips:{}, lineDraft:null, labelDraft:null
 };
+
+/* ================= voice notes ================= */
+const MAX_REC_MS = 15000;   /* keeps clips small enough for the free tier */
+function micSupported(){
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+}
+function pickMime(){
+  const want=["audio/webm;codecs=opus","audio/webm","audio/mp4","audio/aac"];
+  for(const m of want){
+    try{ if(MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) return m; }catch(e){}
+  }
+  return "";
+}
+async function startRec(){
+  S.recErr="";
+  if(!micSupported()){
+    S.recErr="Recording doesn't work on this phone — type your sentence instead."; return drawRec();
+  }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    const mime = pickMime();
+    const mr = new MediaRecorder(stream, mime?{mimeType:mime, audioBitsPerSecond:24000}:undefined);
+    const chunks=[];
+    mr.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+    mr.onstop = ()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const fr = new FileReader();
+      fr.onload = ()=>{ S.recData = fr.result; S.recording=false; drawRec(); };
+      fr.onerror = ()=>{ S.recording=false; S.recErr="Couldn't save that recording."; drawRec(); };
+      fr.readAsDataURL(new Blob(chunks,{type:mime||"audio/webm"}));
+    };
+    S.mr=mr; S.recData=null; S.recording=true; S.recStart=Date.now();
+    mr.start();
+    S.recTimer = setTimeout(stopRec, MAX_REC_MS);
+    drawRec();
+  }catch(e){
+    S.recording=false;
+    S.recErr = (e && e.name==="NotAllowedError")
+      ? "Microphone blocked. Allow it in your browser settings, or just type instead."
+      : "Couldn't reach the microphone. Type your sentence instead.";
+    drawRec();
+  }
+}
+function stopRec(){
+  if(S.recTimer){ clearTimeout(S.recTimer); S.recTimer=null; }
+  try{ if(S.mr && S.mr.state!=="inactive") S.mr.stop(); }catch(e){ S.recording=false; drawRec(); }
+}
+function recBoxHtml(){
+  if(S.recErr) return `<div class="err" style="margin-top:8px;">${esc(S.recErr)}</div>
+    <button class="btn btn-sm btn-dark btn-block" id="recstart" style="margin-top:8px;">🎙️ Try again</button>`;
+  if(S.recording) return `<button class="btn btn-pink btn-block" id="recstop">⏹ Stop — <span id="recsec">0s</span></button>
+    <div style="font-weight:700;font-size:12.5px;margin-top:6px;color:var(--dim);">Stops on its own at 15 seconds</div>`;
+  if(S.recData) return `<div class="recok">🎙️ Voice note ready</div>
+    <div class="ctlrow" style="margin-top:8px;">
+      <button class="btn btn-sm btn-cyan" id="recplay">▶ Hear it</button>
+      <button class="btn btn-sm btn-dark" id="recdel">✕ Delete</button></div>`;
+  return `<button class="btn btn-block" id="recstart">🎙️ Record your sentence</button>`;
+}
+function drawRec(){
+  const el=document.getElementById("recbox");
+  if(!el) return;
+  el.innerHTML = recBoxHtml();
+  bindRec();
+}
+function bindRec(){
+  const a=document.getElementById("recstart"); if(a)a.onclick=()=>{ S.recErr=""; startRec(); };
+  const b=document.getElementById("recstop");  if(b)b.onclick=stopRec;
+  const c=document.getElementById("recdel");   if(c)c.onclick=()=>{ S.recData=null; drawRec(); };
+  const d=document.getElementById("recplay");  if(d)d.onclick=()=>{ if(S.recData) new Audio(S.recData).play().catch(()=>{}); };
+}
+/* fetch a clip only when someone actually taps play — keeps the room snapshot light */
+function bindPlays(){
+  document.querySelectorAll("[data-clip]").forEach(x=>x.onclick=async()=>{
+    const id=x.dataset.clip, was=x.textContent;
+    x.textContent="…";
+    try{
+      let d=S.clips[id];
+      if(!d){ d=(await S.db.ref("audio/"+S.room+"/"+id).once("value")).val(); if(d) S.clips[id]=d; }
+      if(!d){ x.textContent="✕ gone"; return; }
+      await new Audio(d).play();
+      x.textContent=was;
+    }catch(e){ x.textContent=was; }
+  });
+}
 
 /* ---- device identity: lets one phone be recognised as the same player ---- */
 function deviceId(){
@@ -846,9 +944,10 @@ function vPlay(){
       turncard=`<div class="box lime yourturn" style="max-width:370px;width:100%;text-align:center;">
         <div style="font-size:64px;">🎤</div>
         <div class="disp" style="font-size:30px;text-transform:uppercase;margin-top:6px;">Your turn!</div>
-        <p style="font-weight:700;margin-top:8px;">Say your sentence out loud, then type it so the next person can read it.</p>
-        <textarea class="input" id="lineinput" maxlength="220" placeholder="Type the sentence you just said…"
-          style="min-height:76px;margin-top:12px;font-family:'Outfit',sans-serif;font-size:15px;"></textarea>
+        <p style="font-weight:700;margin-top:8px;">Say your sentence — record it, type it, or both.</p>
+        <div id="recbox" style="margin-top:12px;">${recBoxHtml()}</div>
+        <textarea class="input" id="lineinput" maxlength="220" placeholder="Type it too (optional)…"
+          style="min-height:70px;margin-top:10px;font-family:'Outfit',sans-serif;font-size:15px;">${esc(S.lineDraft||"")}</textarea>
         <button class="btn btn-block" id="sendline" style="margin-top:10px;">Send &amp; pass on ▶</button></div>`;
     } else if(pos===turn+1){
       turncard=`<div class="box amber" style="max-width:370px;width:100%;text-align:center;">
@@ -890,27 +989,44 @@ function vPlay(){
   const sb=document.getElementById("sendline");
   if(sb) sb.onclick=sendChainLine;
   const li=document.getElementById("lineinput");
-  if(li) li.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendChainLine(); } });
+  if(li){
+    li.addEventListener("input",()=>{ S.lineDraft=li.value; });
+    li.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ e.preventDefault(); sendChainLine(); } });
+  }
+  bindRec(); bindPlays();
 }
 
-/* ---- note 4: the speaker types their sentence; everyone reads the story ---- */
-function sendChainLine(){
+/* ---- note 4: speak it, record it and/or type it — then pass on ---- */
+async function sendChainLine(){
   const el=document.getElementById("lineinput");
-  if(!el) return;
-  const v=el.value.trim();
-  if(!v) return;
+  const text=(el?el.value:"").trim();
+  if(!text && !S.recData) return;
+  const btn=document.getElementById("sendline");
+  if(btn){ btn.disabled=true; btn.textContent="Sending…"; }
   const c=S.G.chain||{}, lines=(c.lines||[]).slice();
-  lines.push({id:S.me, name:myName(), text:v.slice(0,220)});
-  el.value="";
+  let clip=null;
+  try{
+    if(S.recData){
+      clip="c"+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+      await S.db.ref("audio/"+S.room+"/"+clip).set(S.recData);
+    }
+  }catch(e){ clip=null; }
+  lines.push({id:S.me, name:myName(), text:text.slice(0,220), clip:clip});
+  if(el) el.value="";
+  S.recData=null; S.lineDraft=null; S.recErr="";
   up({"chain/lines":lines, "chain/turn":(typeof c.turn==="number"?c.turn:0)+1});
+}
+function lineHtml(l,i){
+  return `<div class="sline"><b>${i+1}. ${esc(l.name)}</b>${
+    l.text?esc(l.text):`<span style="opacity:.6;">(voice only)</span>`}${
+    l.clip?`<button class="playbtn" data-clip="${esc(l.clip)}">▶ Play</button>`:""}</div>`;
 }
 function storyBlock(c){
   const lines=(c&&c.lines)||[];
   if(!lines.length) return "";
   return `<div class="box" style="max-width:370px;width:100%;">
     <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">The story so far</div>
-    <div class="story">${lines.map((l,i)=>
-      `<div class="sline"><b>${i+1}. ${esc(l.name)}</b>${esc(l.text)}</div>`).join("")}</div></div>`;
+    <div class="story">${lines.map(lineHtml).join("")}</div></div>`;
 }
 
 /* ================= host ================= */
@@ -1085,6 +1201,10 @@ function parseTime(v){
 }
 /* repaints just the clock, so typing and animations are never interrupted */
 setInterval(()=>{
+  if(S.recording){
+    const el=document.getElementById("recsec");
+    if(el) el.textContent = Math.floor((Date.now()-S.recStart)/1000) + "s";
+  }
   const els = document.querySelectorAll("[data-timer]");
   if(!els.length) return;
   const t = impTimer();
@@ -1369,13 +1489,17 @@ function hChain(b){
       ${(c.lines&&c.lines.length)?`
       <div class="box" style="margin-top:14px;">
         <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">The story so far</div>
-        <div class="story">${c.lines.map((l,i)=>
-          `<div class="sline"><b>${i+1}. ${esc(l.name)}</b>${esc(l.text)}</div>`).join("")}</div>
+        <div class="story">${c.lines.map(lineHtml).join("")}</div>
         <button class="btn btn-sm btn-dark" id="clrstory" style="margin-top:14px;">Clear the story</button>
       </div>`:""}`:``}`;
+  bindPlays();
   const g=document.getElementById("go");
-  if(g)g.onclick=()=>up({chain:{theme:THEMES[Math.floor(Math.random()*THEMES.length)],
-    order:list.map(p=>p.id).sort(()=>Math.random()-0.5), turn:0, ts:Date.now()}, activity:"chain"});
+  if(g)g.onclick=()=>{
+    S.db.ref("audio/"+S.room).remove();          /* old voice notes go with the old story */
+    S.clips={};
+    up({chain:{theme:THEMES[Math.floor(Math.random()*THEMES.length)],
+      order:list.map(p=>p.id).sort(()=>Math.random()-0.5), turn:0, ts:Date.now()}, activity:"chain"});
+  };
   const nx=document.getElementById("next");
   if(nx)nx.onclick=()=>{ up({"chain/turn":turn+1}); if(turn+1>=order.length) burst(); };
   const pv=document.getElementById("prev");
@@ -1383,7 +1507,11 @@ function hChain(b){
   const rs=document.getElementById("restart");
   if(rs)rs.onclick=()=>up({"chain/turn":0});
   const cs=document.getElementById("clrstory");
-  if(cs)cs.onclick=()=>{ if(confirm("Delete the written story? The speaking order stays."))up({"chain/lines":null}); };
+  if(cs)cs.onclick=()=>{
+    if(!confirm("Delete the story and its voice notes? The speaking order stays."))return;
+    S.db.ref("audio/"+S.room).remove(); S.clips={};
+    up({"chain/lines":null});
+  };
 }
 
 function hPairs(b){
