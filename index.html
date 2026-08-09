@@ -281,6 +281,23 @@
   .catbtn:hover{transform:translate(-1px,-1px);}
   .catbtn.on{background:var(--cyan); color:var(--edge); box-shadow:4px 4px 0 var(--edge);}
 
+  /* timer */
+  .clock{
+    font-family:'Space Mono',monospace; font-weight:700;
+    font-size:clamp(44px,13vw,72px); letter-spacing:0.06em;
+    background:var(--edge); color:var(--lime);
+    border:4px solid var(--edge); border-radius:18px; box-shadow:6px 6px 0 var(--edge);
+    padding:16px 10px; margin:10px 0 14px; text-align:center;
+  }
+  .clock.small{font-size:clamp(34px,10vw,48px); padding:10px; margin:0; box-shadow:4px 4px 0 var(--edge);}
+  .clock.up{color:var(--pink); animation:beat .8s ease-in-out infinite;}
+
+  /* presence */
+  .name-chip .dot{width:10px;height:10px;border-radius:50%;background:var(--edge);flex-shrink:0;}
+  .name-chip .dot.off{background:transparent;border:2.5px solid var(--edge);}
+  .name-chip.away{background:var(--surface2); color:var(--dim); box-shadow:2px 2px 0 var(--edge);}
+  .name-chip.away .dot{border-color:var(--dim);}
+
   /* word chain turn states */
   .name-chip.spoken{background:var(--surface2); color:var(--dim); box-shadow:2px 2px 0 var(--edge);}
   .name-chip.speaking{background:var(--pink); color:var(--cream); box-shadow:5px 5px 0 var(--edge); transform:scale(1.06);}
@@ -309,6 +326,8 @@
 /* ================= config ================= */
 const HOST_PASSWORD = "246810";
 const CFG_KEY = "gn_fb_cfg";
+const DEV_KEY = "gn_device_id";
+const GONE_MS = 120000;   /* remove a player who has been offline this long */
 
 /* Your Firebase database. Baked in so players never see a setup screen. */
 const FIREBASE_CONFIG = {
@@ -388,8 +407,22 @@ const S = {
   db:null, room:null, me:null, isHost:false,
   G:null,                       // live game snapshot from firebase
   spinning:false, rot:0, wheelSig:"", localWinner:null,
-  seenSpin:null, scenarioDraft:"", secretCat:"Any"
+  seenSpin:null, scenarioDraft:"", secretCat:"Any", impCat:"Any",
+  tOff:0, busy:false, presenceOn:false
 };
+
+/* ---- device identity: lets one phone be recognised as the same player ---- */
+function deviceId(){
+  try{
+    let d = localStorage.getItem(DEV_KEY);
+    if(!d){ d = "d" + Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem(DEV_KEY, d); }
+    return d;
+  }catch(e){
+    if(!S._dev) S._dev = "d" + Math.random().toString(36).slice(2);
+    return S._dev;
+  }
+}
+function serverNow(){ return Date.now() + (S.tOff||0); }
 
 /* ================= firebase ================= */
 function loadCfg(){
@@ -406,9 +439,73 @@ function initFb(cfg){
 }
 function roomRef(){ return S.db.ref("rooms/" + S.room); }
 function watchRoom(){
+  S.db.ref(".info/serverTimeOffset").on("value", s=>{ S.tOff = s.val()||0; });
   roomRef().on("value", snap=>{
     S.G = snap.val();
-    if(S.view==="host" || S.view==="play") draw();
+    const before = S.view;
+    if(S.isHost) hostSweep();
+    else settleMe();
+    /* never redraw the name screen mid-typing — only when the view actually changes */
+    if(S.view==="host" || S.view==="play" || S.view!==before) draw();
+  });
+}
+
+/* ---- player: work out who I am on every update ---- */
+function settleMe(){
+  if(S.isHost || S.busy || !S.G) return;
+  const players = S.G.players || {};
+
+  if(S.me && players[S.me]){ if(S.view!=="play"){ S.view="play"; } return; }
+
+  const dev = deviceId();
+
+  /* still listed under this device? (refresh, reconnect) */
+  const hit = Object.keys(players).find(k => players[k].dev === dev);
+  if(hit){ S.me = hit; S.view = "play"; attachPresence(); return; }
+
+  /* removed after being away — bring back name, score and place */
+  const old = (S.G.archive || {})[dev];
+  if(old && old.key){
+    S.busy = true;
+    roomRef().child("players/" + old.key)
+      .set({name: old.name, pts: old.pts||0, at: old.at||Date.now(), dev: dev, online: true})
+      .then(()=> roomRef().child("archive/" + dev).remove())
+      .then(()=>{ S.me = old.key; S.view = "play"; S.busy = false; attachPresence(); draw(); })
+      .catch(()=>{ S.busy = false; });
+    return;
+  }
+
+  /* host removed me by hand — start over */
+  if(S.me){ S.me = null; S.presenceOn = false; S.view = "joinName"; }
+}
+
+/* ---- presence: mark offline the moment the connection drops ---- */
+function attachPresence(){
+  if(S.presenceOn || !S.me) return;
+  S.presenceOn = true;
+  const ref = roomRef().child("players/" + S.me);
+  S.db.ref(".info/connected").on("value", s=>{
+    if(s.val() !== true || !S.me) return;
+    ref.once("value").then(snap=>{
+      if(!snap.exists()) return;   /* already removed — never recreate a ghost */
+      ref.onDisconnect().update({online:false, off:firebase.database.ServerValue.TIMESTAMP});
+      ref.update({online:true});
+    });
+  });
+}
+
+/* ---- host: archive then remove anyone offline too long ---- */
+function hostSweep(){
+  if(!S.isHost || !S.G) return;
+  const players = S.G.players || {}, now = serverNow();
+  Object.keys(players).forEach(k=>{
+    const v = players[k];
+    if(v.online === false && v.off && (now - v.off) > GONE_MS){
+      const dev = v.dev || k;
+      roomRef().child("archive/" + dev)
+        .set({key:k, name:v.name, pts:v.pts||0, at:v.at||now})
+        .then(()=> roomRef().child("players/" + k).remove());
+    }
   });
 }
 function up(patch){ return roomRef().update(patch); }
@@ -420,7 +517,7 @@ function newRoomCode(){
 }
 function freshGame(){
   return { activity:"lobby", players:{}, wheel:null, secret:null, chain:null, pairs:null,
-           scenarios:DEFAULT_SCENARIOS.slice(), created:Date.now() };
+           imp:null, scenarios:DEFAULT_SCENARIOS.slice(), created:Date.now() };
 }
 
 /* ================= boot ================= */
@@ -571,8 +668,8 @@ function vJoinName(){
     const btn=document.getElementById("go"); btn.disabled=true; btn.textContent="Joining…";
     try{
       const ref = roomRef().child("players").push();
-      await ref.set({name:v, pts:0, at:Date.now()});
-      S.me = ref.key; S.view="play"; draw();
+      await ref.set({name:v, pts:0, at:Date.now(), dev:deviceId(), online:true});
+      S.me = ref.key; S.view="play"; attachPresence(); draw();
     }catch(err){
       document.getElementById("e").textContent="Couldn't join — check your connection.";
       btn.disabled=false; btn.textContent="Join the game";
@@ -609,6 +706,44 @@ function vPlay(){
         <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's a ${esc(o[2])}</span></div>
         <p style="font-weight:600;margin-top:12px;">Ask yes/no questions in Discord and guess it!</p></div>`;
     }
+  } else if(A==="imposter" && S.G.imp){
+    const im=S.G.imp, o=SECRETS[im.idx]||SECRETS[0], amImp=im.impId===me, t=impTimer();
+
+    let card;
+    if(im.revealed){
+      card=`<div class="box lime" style="max-width:370px;width:100%;text-align:center;">
+        <div style="font-size:56px;">🎭</div>
+        <div class="disp" style="font-size:26px;text-transform:uppercase;margin-top:6px;">The imposter was ${esc(im.impName)}</div>
+        <p style="font-weight:700;margin-top:8px;">The word was ${o[0]} ${esc(o[1])}</p></div>`;
+    } else if(amImp){
+      card=`<div class="box pink yourturn" style="max-width:370px;width:100%;text-align:center;">
+        <div style="font-size:64px;">🕵️</div>
+        <div class="disp" style="font-size:30px;text-transform:uppercase;margin-top:6px;">You're the imposter</div>
+        <div style="margin-top:12px;"><span class="catbadge big">${catEmo(o[2])} It's a ${esc(o[2])}</span></div>
+        <p style="font-weight:700;margin-top:12px;">You don't know the word. Listen carefully and bluff — don't get caught!</p></div>`;
+    } else {
+      card=`<div class="box amber revealcard" style="max-width:370px;width:100%;">
+        <span class="catbadge">${catEmo(o[2])} ${esc(o[2])}</span>
+        <div class="emo">${o[0]}</div><div class="nm">${esc(o[1])}</div>
+        <div class="hushbar">🤫 One player can't see this. Find out who.</div></div>`;
+    }
+
+    let qline="";
+    if(im.ask && !im.revealed){
+      const iAsk=im.ask.from===me, iAns=im.ask.to===me;
+      qline=`<div class="box ${iAsk?"lime":(iAns?"cyan":"")}" style="max-width:370px;width:100%;text-align:center;">
+        <div style="font-weight:800;font-size:12px;text-transform:uppercase;letter-spacing:.1em;">Question #${im.ask.n||1}</div>
+        <div class="disp" style="font-size:${iAsk||iAns?"24px":"19px"};text-transform:uppercase;margin-top:6px;">
+          ${iAsk?("🎤 Ask "+esc(im.ask.toName)+" a question")
+               :(iAns?("👂 "+esc(im.ask.fromName)+" is asking you")
+                    :(esc(im.ask.fromName)+" ➜ "+esc(im.ask.toName)))}</div></div>`;
+    }
+
+    const clock=(!im.revealed && !t.none)?`<div class="box" style="max-width:370px;width:100%;text-align:center;padding:14px;">
+      <div class="clock small" data-timer>${fmtTime(t.left)}</div></div>`:"";
+
+    body=`<div style="display:flex;flex-direction:column;gap:14px;align-items:center;width:100%;">
+      ${card}${qline}${clock}</div>`;
   } else if(A==="wheel"){
     const w=S.G.wheel;
     body=`<div class="box" style="max-width:370px;width:100%;text-align:center;">
@@ -678,11 +813,25 @@ function vPlay(){
   <div class="stage">
     <span class="tag live"><b></b> ${esc(myName())} · ${list.length} playing</span>
     <div style="margin-top:20px;width:100%;display:flex;justify-content:center;">${body}</div>
+    <button class="btn btn-sm btn-dark" id="ren" style="margin-top:22px;">Change my name</button>
   </div>`;
+  document.getElementById("ren").onclick=()=>{
+    const v=(prompt("Change your name to:", myName())||"").trim();
+    if(v) roomRef().child("players/"+S.me+"/name").set(v.slice(0,22));
+  };
 }
 
 /* ================= host ================= */
 function vHost(){
+  if(!S.G){
+    app.innerHTML=`<div class="stage">
+      <div class="box amber" style="max-width:420px;">
+        <h2 class="disp" style="font-size:24px;text-transform:uppercase;">Room closed</h2>
+        <p style="font-weight:600;margin-top:10px;">This room no longer exists. Start a new one to keep playing.</p>
+        <button class="btn btn-block" style="margin-top:16px;" onclick="location.reload()">Start again</button>
+      </div></div>`;
+    return;
+  }
   const list=plist();
   app.innerHTML=`
   <div class="shell">
@@ -702,6 +851,7 @@ function vHost(){
       <button class="navtab ${S.tab==="players"?"on":""}" data-t="players">👥 Players</button>
       <button class="navtab ${S.tab==="wheel"?"on":""}" data-t="wheel">🎡 Wheel</button>
       <button class="navtab ${S.tab==="secret"?"on":""}" data-t="secret">🤫 Secret</button>
+      <button class="navtab ${S.tab==="imposter"?"on":""}" data-t="imposter">🕵️ Imposter</button>
       <button class="navtab ${S.tab==="chain"?"on":""}" data-t="chain">📖 Word Chain</button>
       <button class="navtab ${S.tab==="pairs"?"on":""}" data-t="pairs">🎭 Roleplay</button>
       <button class="navtab ${S.tab==="score"?"on":""}" data-t="score">🏆 Scores</button>
@@ -718,24 +868,37 @@ function vHost(){
 
   document.querySelectorAll(".navtab").forEach(b=>b.onclick=()=>{
     S.tab=b.dataset.t; S.wheelSig="";
-    const map={players:"lobby",wheel:"wheel",secret:"secret",chain:"chain",pairs:"pairs",score:"lobby"};
+    const map={players:"lobby",wheel:"wheel",secret:"secret",imposter:"imposter",chain:"chain",pairs:"pairs",score:"lobby"};
     up({activity:map[S.tab]}); draw();
   });
-  ({players:hPlayers,wheel:hWheel,secret:hSecret,chain:hChain,pairs:hPairs,score:hScore})[S.tab](document.getElementById("body"));
+  ({players:hPlayers,wheel:hWheel,secret:hSecret,imposter:hImposter,chain:hChain,pairs:hPairs,score:hScore})[S.tab](document.getElementById("body"));
 }
 function cp(t,b,l){ navigator.clipboard.writeText(t).then(()=>{b.textContent="Copied!";setTimeout(()=>b.textContent=l,1400);})
   .catch(()=>{b.textContent="Copy failed";setTimeout(()=>b.textContent=l,1400);}); }
 
 function hPlayers(b){
-  const list=plist();
+  const list=plist(), away=list.filter(p=>p.online===false);
   b.innerHTML=`
     <h2 class="sec-title">Players</h2>
-    <p class="sec-sub">Names appear here the moment someone taps your link and types a name.</p>
+    <p class="sec-sub">Names appear the moment someone taps your link. Anyone who closes the app goes grey, then drops off by itself after 2 minutes — with their score saved in case they come back.</p>
     <div class="box">
       ${list.length===0?`<div class="none">Waiting for players to join…</div>`:`
-        <div class="names">${list.map(p=>`<div class="name-chip">${esc(p.name)}<button data-i="${p.id}">✕</button></div>`).join("")}</div>`}
+        <div class="names">${list.map(p=>`<div class="name-chip ${p.online===false?"away":""}">
+          <span class="dot ${p.online===false?"off":""}"></span>${esc(p.name)}<button data-i="${p.id}">✕</button></div>`).join("")}</div>
+        ${away.length?`<div style="margin-top:16px;">
+          <button class="btn btn-sm btn-dark" id="clr">Remove ${away.length} who left now</button></div>`:""}`}
     </div>`;
-  b.querySelectorAll("[data-i]").forEach(x=>x.onclick=()=>roomRef().child("players/"+x.dataset.i).remove());
+  b.querySelectorAll("[data-i]").forEach(x=>x.onclick=()=>{
+    const p=list.find(q=>q.id===x.dataset.i);
+    if(!confirm("Remove "+(p?p.name:"this player")+" for good? Their score will be lost."))return;
+    if(p&&p.dev) roomRef().child("archive/"+p.dev).remove();
+    roomRef().child("players/"+x.dataset.i).remove();
+  });
+  const c=document.getElementById("clr");
+  if(c)c.onclick=()=>away.forEach(p=>{
+    roomRef().child("archive/"+(p.dev||p.id)).set({key:p.id,name:p.name,pts:p.pts||0,at:p.at||Date.now()})
+      .then(()=>roomRef().child("players/"+p.id).remove());
+  });
 }
 
 function hWheel(b){
@@ -799,6 +962,35 @@ function doSpin(){
 
 function catEmo(c){ const f=CATS.find(x=>x[0]===c); return f?f[2]:"🎲"; }
 
+/* ================= shared timer ================= */
+function impTimer(){
+  const t = (S.G && S.G.imp && S.G.imp.timer) || null;
+  if(!t) return {left:0, running:false, dur:0, none:true};
+  const left = (t.running && t.endsAt) ? Math.max(0,(t.endsAt - serverNow())/1000) : (t.left||0);
+  return {left, running:!!t.running, dur:t.dur||0};
+}
+function fmtTime(s){
+  s = Math.max(0, Math.ceil(s));
+  return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0");
+}
+function parseTime(v){
+  v = String(v==null?"":v).trim();
+  if(/^\d{1,3}:\d{1,2}$/.test(v)){ const p=v.split(":"); return (+p[0])*60 + (+p[1]); }
+  const n = parseInt(v,10);
+  return isNaN(n) ? 0 : n;
+}
+/* repaints just the clock, so typing and animations are never interrupted */
+setInterval(()=>{
+  const els = document.querySelectorAll("[data-timer]");
+  if(!els.length) return;
+  const t = impTimer();
+  els.forEach(el=>{
+    const up = t.left<=0 && !t.none;
+    el.textContent = up ? "TIME'S UP" : fmtTime(t.left);
+    el.classList.toggle("up", up);
+  });
+}, 250);
+
 function hSecret(b){
   const list=plist(), sec=S.G.secret, o=sec?(SECRETS[sec.idx]||SECRETS[0]):null;
   b.innerHTML=`
@@ -833,6 +1025,120 @@ function hSecret(b){
       idx:pool[Math.floor(Math.random()*pool.length)], ts:Date.now()}, activity:"secret"});
     burst();
   };
+}
+
+function newAsk(list, prev){
+  if(list.length<2) return null;
+  let a, z, tries=0;
+  do{
+    a = list[Math.floor(Math.random()*list.length)];
+    z = list[Math.floor(Math.random()*list.length)];
+    tries++;
+  }while((a.id===z.id || (prev && prev.from===a.id && prev.to===z.id)) && tries<40);
+  if(a.id===z.id) return null;
+  return {from:a.id, fromName:a.name, to:z.id, toName:z.name, n:(prev?(prev.n||0):0)+1};
+}
+
+function hImposter(b){
+  const list=plist(), im=S.G.imp, o=im?(SECRETS[im.idx]||SECRETS[0]):null, t=impTimer();
+  b.innerHTML=`
+    <h2 class="sec-title">Imposter</h2>
+    <p class="sec-sub">Everyone sees the word — except one person. They have to bluff. Ask each other questions in turn and work out who's faking.</p>
+    <div class="box">
+      <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">Word category</div>
+      <div class="cats">${CATS.map(c=>
+        `<button class="catbtn ${S.impCat===c[0]?"on":""}" data-ic="${c[0]}">${c[2]} ${esc(c[1])}</button>`).join("")}</div>
+      <div style="margin-top:16px;">
+        <button class="btn btn-lime btn-block" id="igo" ${list.length<3?"disabled":""}>${im?"New round":"Start a round"}</button>
+        ${list.length<3?`<div class="none">Need at least 3 players — 2 real ones plus the imposter.</div>`:""}
+      </div>
+    </div>
+    ${im?`
+      <div class="box amber" style="margin-top:14px;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">The word (host only)</div>
+        <div style="font-size:52px;margin-top:6px;">${o[0]}</div>
+        <div class="disp" style="font-size:26px;text-transform:uppercase;">${esc(o[1])}</div>
+        <div style="margin-top:10px;"><span class="catbadge">${catEmo(o[2])} ${esc(o[2])}</span></div>
+      </div>
+      <div class="box pink" style="margin-top:14px;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">The imposter (host only)</div>
+        <div class="disp" style="font-size:clamp(28px,8vw,42px);text-transform:uppercase;margin-top:4px;">🕵️ ${esc(im.impName)}</div>
+      </div>
+
+      <div class="box" style="margin-top:14px;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--dim);">Timer</div>
+        <div class="clock" data-timer>${t.none?"0:00":fmtTime(t.left)}</div>
+        <div class="addrow" style="justify-content:center;">
+          <input class="input" id="tdur" value="${t.dur||90}" style="max-width:130px;text-align:center;" placeholder="90 or 1:30">
+          <button class="btn btn-sm btn-cyan" id="tset">Set</button>
+        </div>
+        <div class="cats" style="justify-content:center;">
+          ${[30,60,90,120,180,300].map(s=>`<button class="catbtn" data-t="${s}">${fmtTime(s)}</button>`).join("")}
+        </div>
+        <div class="ctlrow" style="margin-top:14px;">
+          <button class="btn btn-pink" id="trun">${t.running?"⏸ Pause":"▶ Start"}</button>
+          <button class="btn btn-sm btn-dark" id="tres">↻ Reset</button>
+        </div>
+      </div>
+
+      <div class="box cyan" style="margin-top:14px;text-align:center;">
+        <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">Question ${im.ask?("#"+im.ask.n):""}</div>
+        <div class="disp" style="font-size:clamp(20px,5.5vw,30px);text-transform:uppercase;margin-top:6px;">
+          ${im.ask?`${esc(im.ask.fromName)} <span style="opacity:.55;">asks</span> ${esc(im.ask.toName)}`:"Tap for the first question"}</div>
+        <div class="ctlrow" style="margin-top:14px;"><button class="btn btn-amber" id="iask">🎲 ${im.ask?"Next question":"First question"}</button></div>
+      </div>
+
+      <div class="box ${im.revealed?"lime":""}" style="margin-top:14px;text-align:center;">
+        ${im.revealed
+          ? `<div style="font-size:46px;">🎭</div>
+             <div class="disp" style="font-size:26px;text-transform:uppercase;margin-top:6px;">It was ${esc(im.impName)}</div>
+             <p style="font-weight:700;margin-top:6px;">The word was ${o[0]} ${esc(o[1])}</p>`
+          : `<button class="btn btn-block" id="irev">🎭 Reveal the imposter</button>`}
+      </div>`:""}`;
+
+  b.querySelectorAll("[data-ic]").forEach(x=>x.onclick=()=>{ S.impCat=x.dataset.ic; draw(); });
+
+  const g=document.getElementById("igo");
+  if(g)g.onclick=()=>{
+    const pool=SECRETS.map((s,i)=>i).filter(i=>S.impCat==="Any"||SECRETS[i][2]===S.impCat);
+    const imp=list[Math.floor(Math.random()*list.length)];
+    const dur=parseTime(document.getElementById("tdur")?document.getElementById("tdur").value:90)||90;
+    up({imp:{ idx:pool[Math.floor(Math.random()*pool.length)],
+             impId:imp.id, impName:imp.name, revealed:false,
+             ask:newAsk(list,null),
+             timer:{dur:dur, left:dur, running:false, endsAt:null},
+             ts:Date.now() }, activity:"imposter"});
+    burst();
+  };
+
+  const ask=document.getElementById("iask");
+  if(ask)ask.onclick=()=>{ const a=newAsk(list, im.ask); if(a) up({"imp/ask":a}); };
+
+  const rev=document.getElementById("irev");
+  if(rev)rev.onclick=()=>{ if(confirm("Show everyone who the imposter was?")) up({"imp/revealed":true}); };
+
+  const setD=()=>{
+    const d=parseTime(document.getElementById("tdur").value);
+    if(d>0) up({"imp/timer":{dur:d, left:d, running:false, endsAt:null}});
+  };
+  const sb=document.getElementById("tset"); if(sb)sb.onclick=setD;
+  const di=document.getElementById("tdur");
+  if(di)di.addEventListener("keydown",e=>{if(e.key==="Enter")setD();});
+  b.querySelectorAll("[data-t]").forEach(x=>x.onclick=()=>{
+    const d=+x.dataset.t; up({"imp/timer":{dur:d, left:d, running:false, endsAt:null}});
+  });
+
+  const run=document.getElementById("trun");
+  if(run)run.onclick=()=>{
+    const c=impTimer();
+    if(c.running) up({"imp/timer":{dur:c.dur, left:c.left, running:false, endsAt:null}});
+    else{
+      const l=c.left>0?c.left:(c.dur||90);
+      up({"imp/timer":{dur:c.dur||90, left:l, running:true, endsAt:serverNow()+l*1000}});
+    }
+  };
+  const res=document.getElementById("tres");
+  if(res)res.onclick=()=>{ const c=impTimer(); up({"imp/timer":{dur:c.dur||90, left:c.dur||90, running:false, endsAt:null}}); };
 }
 
 function hChain(b){
