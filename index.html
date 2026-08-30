@@ -358,6 +358,7 @@
 const HOST_PASSWORD = "246810";
 const CFG_KEY = "gn_fb_cfg";
 const DEV_KEY = "gn_device_id";
+const LAST_KEY = "gn_last_room";
 const GONE_MS = 120000;   /* remove a player who has been offline this long */
 
 /* Your Firebase database. Baked in so players never see a setup screen. */
@@ -541,6 +542,26 @@ function deviceId(){
 }
 function serverNow(){ return Date.now() + (S.tOff||0); }
 
+/* ---- remember the room across a page reload ---- */
+function saveLast(room, host){
+  try{ localStorage.setItem(LAST_KEY, JSON.stringify({room:room, host:!!host})); }catch(e){}
+}
+function loadLast(){
+  try{ const r=localStorage.getItem(LAST_KEY); return r?JSON.parse(r):null; }catch(e){ return null; }
+}
+function clearLast(){ try{ localStorage.removeItem(LAST_KEY); }catch(e){} }
+
+/* ---- go back to the front page without deleting the room ---- */
+function leaveRoom(){
+  try{ if(S.room) roomRef().off(); }catch(e){}
+  detachPresence();
+  clearLast();
+  S.room=null; S.G=null; S.me=null; S.isHost=false;
+  S.tab="players"; S.clips={}; S.lineDraft=null; S.labelDraft=null;
+  S.recData=null; S.recErr=""; S.view="home";
+  draw();
+}
+
 /* ================= firebase ================= */
 function loadCfg(){
   if(FIREBASE_CONFIG && FIREBASE_CONFIG.databaseURL) return FIREBASE_CONFIG;
@@ -569,7 +590,11 @@ function watchRoom(){
 
 /* ---- player: work out who I am on every update ---- */
 function settleMe(){
-  if(S.isHost || S.busy || !S.G) return;
+  if(S.isHost || S.busy) return;
+  if(!S.G){                       /* room was deleted while we were away */
+    if(S.view==="restoring"){ clearLast(); S.room=null; S.view="home"; }
+    return;
+  }
   const players = S.G.players || {};
 
   if(S.me && players[S.me]){ if(S.view!=="play"){ S.view="play"; } return; }
@@ -592,8 +617,8 @@ function settleMe(){
     return;
   }
 
-  /* host removed me by hand — start over */
-  if(S.me){ S.me = null; S.presenceOn = false; S.view = "joinName"; }
+  /* host removed me by hand, or this device never joined — ask for a name */
+  if(S.me || S.view==="restoring"){ S.me = null; detachPresence(); S.view = "joinName"; }
 }
 
 /* ---- presence: mark offline the moment the connection drops ---- */
@@ -665,13 +690,29 @@ function boot(){
   if(!cfg){ S.view = joinCode ? "nocfg" : "setup"; return draw(); }
   if(!initFb(cfg)){ S.view="setup"; S.err="That config didn't work — paste it again."; return draw(); }
 
-  if(joinCode){ S.room=joinCode; S.view="joinName"; watchRoom(); return draw(); }
+  if(joinCode){
+    S.room=joinCode; saveLast(joinCode,false);
+    S.view="restoring"; watchRoom(); return draw();
+  }
+
+  /* reload: drop straight back into the game instead of the front page */
+  const last = loadLast();
+  if(last && last.room){
+    S.view="restoring"; draw();
+    S.db.ref("rooms/"+last.room).once("value").then(snap=>{
+      if(!snap.exists()){ clearLast(); S.view="home"; return draw(); }
+      S.room=last.room;
+      if(last.host){ S.isHost=true; S.view="host"; }
+      watchRoom(); draw();
+    }).catch(()=>{ S.view="home"; draw(); });
+    return;
+  }
   S.view="home"; draw();
 }
 
 function draw(){
   const v = {
-    setup:vSetup, nocfg:vNoCfg, home:vHome, auth:vAuth,
+    setup:vSetup, nocfg:vNoCfg, home:vHome, auth:vAuth, restoring:vLoading,
     joinName:vJoinName, play:vPlay, host:vHost
   }[S.view];
   if(v) v();
@@ -762,7 +803,7 @@ function vHome(){
     try{
       const snap=await S.db.ref("rooms/"+code).once("value");
       if(!snap.exists()){ e.textContent="No game with that code."; return; }
-      S.room=code; S.view="joinName"; watchRoom(); draw();
+      S.room=code; saveLast(code,false); S.view="restoring"; watchRoom(); draw();
     }catch(err){ e.textContent="Couldn't reach the game — check your connection."; }
   };
   document.getElementById("j").onclick=join;
@@ -775,6 +816,7 @@ async function startHosting(){
   S.room=newRoomCode(); S.isHost=true;
   try{
     await roomRef().set(freshGame());
+    saveLast(S.room, true);
     watchRoom(); S.view="host"; draw();
   }catch(err){
     S.isHost=false; S.room=null;
@@ -1014,9 +1056,13 @@ function vPlay(){
   <div class="stage">
     <span class="tag live"><b></b> ${esc(myName())} · ${list.length} playing${S.G.label?" · "+esc(S.G.label):""}</span>
     <div style="margin-top:20px;width:100%;display:flex;justify-content:center;">${body}</div>
-    <button class="btn btn-sm btn-dark" id="ren" style="margin-top:22px;">Not you? Join as someone else</button>
+    <div class="ctlrow" style="margin-top:22px;">
+      <button class="btn btn-sm btn-dark" id="ren">Not you? Join as someone else</button>
+      <button class="btn btn-sm btn-dark" id="lv">← Leave</button>
+    </div>
   </div>`;
   document.getElementById("ren").onclick=joinAsSomeoneElse;
+  document.getElementById("lv").onclick=()=>{ if(confirm("Leave this game?")) leaveRoom(); };
   app.querySelectorAll("[data-v]").forEach(x=>x.onclick=()=>
     roomRef().child("imp/vote/tally/"+S.me).set(x.dataset.v));
   const sb=document.getElementById("sendline");
@@ -1069,7 +1115,7 @@ function vHost(){
       <div class="box amber" style="max-width:420px;">
         <h2 class="disp" style="font-size:24px;text-transform:uppercase;">Room closed</h2>
         <p style="font-weight:600;margin-top:10px;">This room no longer exists. Start a new one to keep playing.</p>
-        <button class="btn btn-block" style="margin-top:16px;" onclick="location.reload()">Start again</button>
+        <button class="btn btn-block" style="margin-top:16px;" onclick="clearLast();location.reload()">Start again</button>
       </div></div>`;
     return;
   }
@@ -1078,7 +1124,10 @@ function vHost(){
   <div class="shell">
     <div class="topbar">
       <div class="logo"><div class="logo-mark"></div><div class="logo-txt">Game Night</div></div>
-      <span class="tag live"><b></b> ${list.length} joined</span>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="tag live"><b></b> ${list.length} joined</span>
+        <button class="btn btn-sm btn-dark" id="hlv">← Menu</button>
+      </div>
     </div>
     <div class="box cyan" style="margin-bottom:18px;">
       <div style="font-weight:800;font-size:13px;text-transform:uppercase;letter-spacing:.1em;">Send this link to your group</div>
@@ -1112,6 +1161,9 @@ function vHost(){
   document.getElementById("cpM").onclick=e=>cp(
     `🎮 English Hub Game Night is starting${lbl}!\nTap the link and type your name — that's it, no sign-up:\n${link}\n\nOr open ${location.origin+location.pathname} and enter code: ${S.room}`,
     e.target,"Copy Discord message");
+  document.getElementById("hlv").onclick=()=>{
+    if(confirm("Back to the menu?\n\nThe game keeps running — you can rejoin with code "+S.room+"."))leaveRoom();
+  };
   const lblEl=document.getElementById("rlbl");
   const saveLbl=()=>{ S.labelDraft=null; up({label:lblEl.value.trim().slice(0,34)}); };
   document.getElementById("rlblsave").onclick=saveLbl;
